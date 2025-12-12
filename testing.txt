@@ -1,0 +1,132 @@
+# websphere_curl_report.ps1
+# Inputs:
+#   servers.txt      -> list of hosts (one per line)
+#   was_search.txt   -> list of paths to test (one per line, or "path  description" - only first token used)
+# Output:
+#   websphere_security_report_curl.csv
+
+$ports = @(80, 9080, 9443, 9043)
+
+$serversFile = "servers.txt"
+$fingerFile  = "was_search.txt"
+$outFile     = "websphere_security_report_curl.csv"
+
+# Read servers (ignore blanks and comments)
+$servers = Get-Content $serversFile |
+  ForEach-Object { $_.Trim() } |
+  Where-Object { $_ -ne "" -and -not $_.StartsWith("#") }
+
+# Read fingerprint paths: take first token, ensure leading slash
+$paths = Get-Content $fingerFile |
+  ForEach-Object { $_.Trim() } |
+  Where-Object { $_ -ne "" -and -not $_.StartsWith("#") } |
+  ForEach-Object {
+    $p = ($_ -split "\s+")[0]
+    if (-not $p.StartsWith("/")) { $p = "/" + $p }
+    $p
+  } | Select-Object -Unique
+
+# CSV header
+"timestamp,host,port,scheme,base_status,server_header,title,allow_methods,path,status,location" | Out-File -Encoding UTF8 $outFile
+
+function Get-TitleFromHtml($html) {
+  if ($null -eq $html) { return "" }
+  $m = [regex]::Match($html, "(?is)<title>\s*(.*?)\s*</title>")
+  if ($m.Success) { return ($m.Groups[1].Value -replace '"','""') }
+  return ""
+}
+
+foreach ($host in $servers) {
+  foreach ($port in $ports) {
+
+    # Choose scheme: usually 9443 is HTTPS, others HTTP. If your 9043 is HTTPS, this still works due to fallback.
+    $scheme = if ($port -eq 9443) { "https" } else { "http" }
+    $baseUrl = "{0}://{1}:{2}/" -f $scheme, $host, $port
+
+    $timestamp = (Get-Date).ToString("s")
+    $baseStatus = ""
+    $serverHeader = ""
+    $title = ""
+    $allow = ""
+    $location = ""
+
+    # Base request: get headers + title (best-effort)
+    try {
+      # Headers
+      $hdr = curl.exe -k -sS -I --connect-timeout 3 --max-time 8 $baseUrl 2>$null
+      if ($hdr) {
+        $statusLine = ($hdr | Select-String -Pattern "^HTTP/").Line | Select-Object -First 1
+        if ($statusLine) {
+          $baseStatus = ($statusLine -split "\s+")[1]
+        }
+        $serverLine = ($hdr | Select-String -Pattern "^Server:" -CaseSensitive:$false).Line | Select-Object -First 1
+        if ($serverLine) { $serverHeader = ($serverLine -replace "^Server:\s*", "").Trim() }
+        $locLine = ($hdr | Select-String -Pattern "^Location:" -CaseSensitive:$false).Line | Select-Object -First 1
+        if ($locLine) { $location = ($locLine -replace "^Location:\s*", "").Trim() }
+      }
+
+      # Title
+      $body = curl.exe -k -sS -L --connect-timeout 3 --max-time 10 $baseUrl 2>$null
+      $title = Get-TitleFromHtml $body
+    } catch {
+      # try HTTPS fallback if HTTP failed (common on 9043/9443)
+      if ($scheme -eq "http") {
+        $scheme2 = "https"
+        $baseUrl2 = "{0}://{1}:{2}/" -f $scheme2, $host, $port
+        try {
+          $hdr = curl.exe -k -sS -I --connect-timeout 3 --max-time 8 $baseUrl2 2>$null
+          if ($hdr) {
+            $statusLine = ($hdr | Select-String -Pattern "^HTTP/").Line | Select-Object -First 1
+            if ($statusLine) { $baseStatus = ($statusLine -split "\s+")[1] }
+            $serverLine = ($hdr | Select-String -Pattern "^Server:" -CaseSensitive:$false).Line | Select-Object -First 1
+            if ($serverLine) { $serverHeader = ($serverLine -replace "^Server:\s*", "").Trim() }
+            $locLine = ($hdr | Select-String -Pattern "^Location:" -CaseSensitive:$false).Line | Select-Object -First 1
+            if ($locLine) { $location = ($locLine -replace "^Location:\s*", "").Trim() }
+          }
+          $body = curl.exe -k -sS -L --connect-timeout 3 --max-time 10 $baseUrl2 2>$null
+          $title = Get-TitleFromHtml $body
+          $scheme = $scheme2
+          $baseUrl = $baseUrl2
+        } catch { }
+      }
+    }
+
+    # OPTIONS for methods (http-methods equivalent)
+    try {
+      $opt = curl.exe -k -sS -i -X OPTIONS --connect-timeout 3 --max-time 8 $baseUrl 2>$null
+      if ($opt) {
+        $allowLine = ($opt | Select-String -Pattern "^Allow:" -CaseSensitive:$false).Line | Select-Object -First 1
+        if ($allowLine) { $allow = ($allowLine -replace "^Allow:\s*", "").Trim() }
+      }
+    } catch { }
+
+    # Enum paths (http-enum equivalent)
+    foreach ($p in $paths) {
+      $url = "{0}://{1}:{2}{3}" -f $scheme, $host, $port, $p
+      $st = ""
+      $loc = ""
+
+      try {
+        # Get status + location for each path
+        $hdr2 = curl.exe -k -sS -I --connect-timeout 3 --max-time 8 $url 2>$null
+        if ($hdr2) {
+          $statusLine2 = ($hdr2 | Select-String -Pattern "^HTTP/").Line | Select-Object -First 1
+          if ($statusLine2) { $st = ($statusLine2 -split "\s+")[1] }
+          $locLine2 = ($hdr2 | Select-String -Pattern "^Location:" -CaseSensitive:$false).Line | Select-Object -First 1
+          if ($locLine2) { $loc = ($locLine2 -replace "^Location:\s*", "").Trim() }
+        }
+      } catch { }
+
+      # Write one row per path (displayall behavior)
+      $row = '"' + $timestamp + '","' + $host + '","' + $port + '","' + $scheme + '","' +
+             $baseStatus + '","' + ($serverHeader -replace '"','""') + '","' + $title + '","' +
+             ($allow -replace '"','""') + '","' + ($p -replace '"','""') + '","' + $st + '","' +
+             ($loc -replace '"','""') + '"'
+      Add-Content -Encoding UTF8 $outFile $row
+
+      Start-Sleep -Milliseconds 150  # throttle (reduce impact)
+    }
+  }
+}
+
+Write-Host "Done. Report: $outFile"
